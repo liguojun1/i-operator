@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/liguojun1/i-operator/api/v1"
+	pkgerror "github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,6 +50,8 @@ const (
 // +kubebuilder:rbac:groups=core.crd.test.com,resources=applications,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core.crd.test.com,resources=applications/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.crd.test.com,resources=applications/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -71,42 +75,49 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if !controllerutil.ContainsFinalizer(&app, Finalizer) {
 			controllerutil.AddFinalizer(&app, Finalizer)
 			if err := r.Update(ctx, &app); err != nil {
+				log.Error(err, "unable to add finalizer to application")
 				return ctrl.Result{}, err
 			}
-			r.Recorder.Event(&app, corev1.EventTypeNormal, "Success", "Application finalized")
+			r.Recorder.Event(&app, corev1.EventTypeNormal, "Success", "add application finalized")
 		}
 	} else {
-		err := r.RemoveExternalResource()
-		if err != nil {
-			return ctrl.Result{}, err
-		}
 		if controllerutil.ContainsFinalizer(&app, Finalizer) {
+			err := r.RemoveExternalResource()
+			if err != nil {
+				log.Error(err, "unable to cleanup application")
+				return ctrl.Result{}, err
+			}
 			controllerutil.RemoveFinalizer(&app, Finalizer)
 			if err := r.Update(ctx, &app); err != nil {
 				return ctrl.Result{}, err
 			}
-			r.Recorder.Event(&app, corev1.EventTypeNormal, "Success", "Application finalized remove ")
+			r.Recorder.Event(&app, corev1.EventTypeNormal, "Success", "remove application finalized")
 		}
 		return ctrl.Result{}, nil
 	}
 	log.Info("run reconcile")
 	err := r.syncApp(ctx, req, &app)
 	if err != nil {
+		log.Error(err, "unable to sync application")
 		return ctrl.Result{}, err
 	}
 	dp := &appsv1.Deployment{}
 	objKey := client.ObjectKey{Name: fullName(app.Name), Namespace: app.Namespace}
 	err = r.Get(ctx, objKey, dp)
 	if err != nil {
-		return ctrl.Result{}, err
+		log.Error(err, "unable to fetch deployment", "deployment", objKey.String())
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	copyApp := app.DeepCopy()
 	copyApp.Status.Ready = dp.Status.ReadyReplicas >= 1
 	if !reflect.DeepEqual(copyApp, app) {
-		err = r.Status().Update(ctx, copyApp)
+		log.Info("app changed,update app status")
+		err = r.Client.Status().Update(ctx, copyApp)
 		if err != nil {
+			log.Error(err, "unable to update application status")
 			return ctrl.Result{}, err
 		}
+		r.Recorder.Event(&app, corev1.EventTypeNormal, "UpdateStatus", fmt.Sprintf("update status from %v to %v", app.Status, copyApp.Status))
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
@@ -115,6 +126,8 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 func (r *ApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.Application{}).
+		Owns(&appsv1.Deployment{}).
+		Named("application").
 		Complete(r)
 }
 
@@ -134,14 +147,31 @@ func (r *ApplicationReconciler) syncEnabled(ctx context.Context, req ctrl.Reques
 	objKey := client.ObjectKey{Name: fullName(req.Name), Namespace: req.Namespace}
 	if err := r.Get(ctx, objKey, &dp); err != nil {
 		if client.IgnoreNotFound(err) == nil {
-			dp = generalDeployment(app)
+			log.Log.Info("reconcile application create deployment", "app", app.Namespace, "deployment", objKey.Name)
+			dp = r.generalDeployment(app)
 			if err := r.Create(ctx, &dp); err != nil {
-				return err
+				return pkgerror.WithMessage(err, "unable to create deployment")
 			}
 			log.Log.Info("create deployment", "name", objKey.Name, "namespace", objKey.Namespace)
+		} else {
+			return pkgerror.WithMessagef(err, "unable to fetch deployment [%s]", objKey.String())
+		}
+	}
+	if !equal(&dp, app) {
+		log.Log.Info("reconcile application update deployment", "app", app.Namespace, "deployment", objKey.Name)
+		dp.Spec.Template.Spec.Containers[0].Image = app.Spec.Image
+		if err := r.Update(ctx, &dp); err != nil {
+			return pkgerror.WithMessage(err, "unable to update deployment")
 		}
 	}
 	return nil
+}
+
+func equal(dp *appsv1.Deployment, app *v1.Application) bool {
+	if dp.Spec.Template.Spec.Containers[0].Image == app.Spec.Image {
+		return true
+	}
+	return false
 }
 
 func (r *ApplicationReconciler) syncDisabled(ctx context.Context, req ctrl.Request, app *v1.Application) error {
@@ -151,8 +181,9 @@ func (r *ApplicationReconciler) syncDisabled(ctx context.Context, req ctrl.Reque
 		if client.IgnoreNotFound(err) == nil {
 			return nil
 		}
-		return err
+		return pkgerror.WithMessagef(err, "unable to fetch deployment [%s]", objKey.String())
 	}
+	log.Log.Info("reconcile application delete deployment", "app", app.Namespace, "deployment", objKey.Name)
 	err := r.Delete(ctx, &dp)
 	return err
 }
@@ -161,7 +192,7 @@ func fullName(name string) string {
 	return "app-" + name
 }
 
-func generalDeployment(app *v1.Application) appsv1.Deployment {
+func (r *ApplicationReconciler) generalDeployment(app *v1.Application) appsv1.Deployment {
 	dp := appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fullName(app.Name),
@@ -191,5 +222,6 @@ func generalDeployment(app *v1.Application) appsv1.Deployment {
 			},
 		},
 	}
+	_ = controllerutil.SetControllerReference(app, &dp, r.Scheme)
 	return dp
 }
