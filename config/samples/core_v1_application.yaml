@@ -7,5 +7,5 @@ metadata:
   name: application-sample
 spec:
   # TODO(user): Add fields here
-  image: harbor-int.hongkang-life.com/infra/nginx:1.25.5
+  image: xxxxx/infra/nginx:1.25.5
   enabled: true
